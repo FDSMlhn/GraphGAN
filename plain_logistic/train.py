@@ -17,13 +17,23 @@ import numpy as np
 import tensorflow as tf
 
 def main(argv):
-    
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch_size', default=1024, help= "assign batchsize for training and eval")
+    parser.add_argument('--learning_rate', default=0.001, help= "learning rate for training")
+    parser.add_argument('--dropout', default=0.2, help= "dropout rate")
+    parser.add_argument('--max_steps', default = 10, help="Max steps to train in trainSpec")
+    parser.add_argument('--model_dir', default = "tmp/", help="Directory to save model files")
+    args = parser.parse_args()
+
+
     tf.logging.set_verbosity(tf.logging.INFO)
 
 
     #file_dir = '/Users/Dreamland/Documents/University_of_Washington/STAT548/project/GraphGAN/yelp_dataset/'
     file_dir = '/home/FDSM_lhn/GraphGAN/yelp_dataset/'
     #file_dir = 'yelp_dataset/'
+    
     adj_mat_list, user_norm, item_norm,\
                 u_features, v_features, new_reviews, miscellany,\
                 N, num_train, num_val, num_test, train_idx, val_idx, test_idx = preprocessing(file_dir, verbose=True, test= False)
@@ -56,27 +66,27 @@ def main(argv):
     input_additional_info['v_features'] = v_features
     input_additional_info['col_mapper'] = miscellany['col_mapper']
 
-    temp_item_feature_columns = item_feature_columns
-    item_feature_columns = []
-    for feat_col in temp_item_feature_columns:
-        if 'categories' not in feat_col.name:
-            item_feature_columns.append(feat_col)
+    #temp_item_feature_columns = item_feature_columns
+    #item_feature_columns = []
+    #for feat_col in temp_item_feature_columns:
+    #    if 'categories' not in feat_col.name:
+    #        item_feature_columns.append(feat_col)
    
 
 
     model_params = tf.contrib.training.HParams(
     num_users = len(user_norm),
     num_items = len(item_norm),
-    batch_size=FLAGS.batch_size,
-    learning_rate=FLAGS.batch_size,
-    dim_user_raw=FLAGS.dim_user_raw,
-    dim_item_raw=FLAGS.dim_item_raw,
-    dim_user_conv=FLAGS.dim_user_conv,
-    dim_item_conv=FLAGS.dim_item_conv,
-    dim_user_embedding=FLAGS.dim_user_embedding,
-    dim_item_embedding=FLAGS.dim_item_embedding,
-    classes=FLAGS.classes,
-    dropout=FLAGS.dropout,
+    batch_size=arg.batch_size,
+    learning_rate=arg.learning_rate,
+    dim_user_raw=10,
+    dim_item_raw=10,
+    dim_user_conv=10,
+    dim_item_conv=10,
+    dim_user_embedding=10,
+    dim_item_embedding=10,
+    classes=5,
+    dropout=arg.dropout,
     user_features_columns = user_feature_columns,
     item_features_columns = item_feature_columns)
         
@@ -87,7 +97,7 @@ def main(argv):
 
     train_spec = tf.estimator.TrainSpec(input_fn=get_input_fn(
         tf.estimator.ModeKeys.TRAIN, model_params,
-        **input_additional_info), max_steps=FLAGS.max_steps)
+        **input_additional_info), max_steps=args.max_steps)
 
     eval_spec = tf.estimator.EvalSpec(input_fn=get_input_fn(
         tf.estimator.ModeKeys.EVAL,
@@ -99,37 +109,4 @@ def main(argv):
     
     
 if __name__ == "__main__":
-    
-    
-    #TODO: add parameters needed later on.
-    flags = tf.app.flags
-    FLAGS = flags.FLAGS
-
-    flags.DEFINE_integer('max_steps',10,
-    "Number of training steps.")
-    flags.DEFINE_integer('batch_size', 10,
-    "Number of observations in a sample")
-    flags.DEFINE_float('learning_rate', 0.001,
-                         "Number of observations in a sample")
-    flags.DEFINE_integer('classes', 5,
-                         "Number of observations in a sample")
-    flags.DEFINE_integer('dim_user_raw', 20,
-                         "Number of observations in a sample")
-    flags.DEFINE_integer('dim_item_raw', 20,
-                         "Number of observations in a sample")
-    flags.DEFINE_integer('dim_user_conv', 30,
-                         "Number of observations in a sample")
-    flags.DEFINE_integer('dim_item_conv', 30,
-                         "Number of observations in a sample")
-    flags.DEFINE_integer('dim_user_embedding', 30,
-                         "Number of observations in a sample")
-    flags.DEFINE_integer('dim_item_embedding', 30,
-                         "Number of observations in a sample")
-    #directory of various files
-    flags.DEFINE_string('model_dir', 'tmp/',
-    "Path for storing the model checkpoints.")
-
-    flags.DEFINE_float('dropout',0.2,
-    "Dropout used for lstm layers.")
-
-    tf.app.run(main=main)
+   main() 
