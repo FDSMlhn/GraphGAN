@@ -1,117 +1,263 @@
 import os
 #os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import logging
 #tf.get_logger().setLevel(logging.ERROR)
-#logging.getLogger('tensorflow').setLevel(logging.ERROR)
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
+from pipeline import preprocessing, get_item_feature_columns, get_user_feature_columns, df2tensor, get_type_dict, construct_feed_dict
+from utils import data_iterator, progress_bar
+from model import BilinearDecoder, LogisticDecoder
 
 import numpy as np
 import functools
 import sys
-
-from data_utils import data_loading
-from scipy.sparse import csr_matrix
-
-from collections import OrderedDict
+import numpy as np
 import tensorflow as tf
-from tensorflow.feature_column import indicator_column,numeric_column, embedding_column, bucketized_column,categorical_column_with_vocabulary_list
-
-from pipeline import preprocessing, get_input_fn, get_item_feature_columns, get_user_feature_columns, df2tensor, get_type_dict
-from estimator_lr import lr_model_fn
 
 
 
+num_epoch = 10
 
-def main(args):
-    tf.logging.set_verbosity(tf.logging.INFO)
+PS_OPS = ['Variable', 'VariableV2', 'AutoReloadVariable']
 
+def assign_to_device(device, ps_device='/cpu:0'):
+    def _assign(op):
+        node_def = op if isinstance(op, tf.NodeDef) else op.node_def
+        if node_def.op in PS_OPS:
+            return ps_device
+        else:
+            return device
+
+    return _assign
+
+
+def main(args):    
+    tf.logging.set_verbosity(tf.logging.ERROR)    
     #file_dir = '/Users/Dreamland/Documents/University_of_Washington/STAT548/project/GraphGAN/yelp_dataset/'
     file_dir = '/home/FDSM_lhn/GraphGAN/yelp_dataset/'
     #file_dir = 'yelp_dataset/'
-    
-    adj_mat_list, user_norm, item_norm,\
-                u_features, v_features, new_reviews, miscellany,\
+    u_features, v_features, new_reviews, miscellany,\
                 N, num_train, num_val, num_test, train_idx, val_idx, test_idx = preprocessing(file_dir, verbose=True, test= False)
-
-#     session_config = tf.ConfigProto(
-#         log_device_placement=True,
-#         inter_op_parallelism_threads=0,
-#         intra_op_parallelism_threads=0,
-#         allow_soft_placement=True)
-
-#     session_config.gpu_options.allow_growth = True
-#     session_config.gpu_options.allocator_type = 'BFC'
-    run_config=tf.estimator.RunConfig(
-            model_dir=args.model_dir,
-    #        session_config = session_config,
-            save_checkpoints_secs=20,
-            save_summary_steps=100)
-
     item_type_dict = get_type_dict(v_features)
     user_type_dict = get_type_dict(u_features)
-    
+
+
     item_feature_columns = get_item_feature_columns(miscellany['business_vocab_list'], item_type_dict)
     user_feature_columns = get_user_feature_columns(user_type_dict)
     
-    input_additional_info = {}
-    for name in ['adj_mat_list', 'user_norm', 'item_norm', 'new_reviews', 'num_train', 'num_val','num_test', 'train_idx', 'val_idx', 'test_idx']:
-        exec("input_additional_info[{0!r}] = {0}".format(name))
-    
-    input_additional_info['u_features'] = u_features
-    input_additional_info['v_features'] = v_features
-    input_additional_info['col_mapper'] = miscellany['col_mapper']
-
-    #temp_item_feature_columns = item_feature_columns
-    #item_feature_columns = []
-    #for feat_col in temp_item_feature_columns:
-    #    if 'categories' not in feat_col.name:
-    #        item_feature_columns.append(feat_col)
+    additional_info = {}
+    for name in ['v_features', 'u_features']: 
+        exec("additional_info[{0!r}] = {0}".format(name))
    
-
-
     model_params = tf.contrib.training.HParams(
-    num_users = len(user_norm),
-    num_items = len(item_norm),
-    batch_size=args.batch_size,
+    num_users=u_features.shape[0],
+    num_items=v_features.shape[0],
+    model_dir=args.model_dir,
     learning_rate=args.learning_rate,
-    dim_user_raw=10,
-    dim_item_raw=10,
-    dim_user_conv=10,
-    dim_item_conv=10,
-    dim_user_embedding=10,
-    dim_item_embedding=10,
+    dim_user_raw=args.dim_user_raw,
+    dim_item_raw=args.dim_item_raw,
+    dim_user_conv=args.dim_user_conv,
+    dim_item_conv=args.dim_item_conv,
+    dim_user_embedding=args.dim_user_embedding,
+    dim_item_embedding=args.dim_item_embedding,
+    regularizer_parameter= args.regularizer_parameter,
     classes=5,
+    num_basis=args.num_basis,
+    is_stacked = args.is_stacked,
     dropout=args.dropout,
     user_features_columns = user_feature_columns,
     item_features_columns = item_feature_columns)
+    
+    placeholders = {
+            'user_id': tf.sparse_placeholder(tf.float64),
+            'item_id': tf.sparse_placeholder(tf.float64),
+            'labels': tf.placeholder(tf.int64, shape = (None,)),
+            'training':tf.placeholder(tf.bool) 
+        }
+
+    v_feature_placeholder_dict = {}
+    for k, v in item_type_dict.items():
+        if "categories" != k:
+            v_feature_placeholder_dict[k] = tf.placeholder(v, shape = (None,))
+    v_feature_placeholder_dict["categories"] = tf.sparse_placeholder(tf.string)
+    
+    u_feature_placeholder_dict = {}
+    for k, v in user_type_dict.items():
+        u_feature_placeholder_dict[k] = tf.placeholder(v, shape = (None,))
+
+    placeholders['u_features'] = u_feature_placeholder_dict
+    placeholders['v_features'] = v_feature_placeholder_dict
+ 
+    cur_MODEL= BilinearDecoder if args.bilinear else LogisticDecoder
+
+    if args.use_gpu:
+        with tf.device(assign_to_device('/gpu:{}'.format(0), ps_device='/cpu:0')):
+            #initialize placeholder
+            #placeholders = {
+            #        'user_id': tf.sparse_placeholder(tf.float64),
+            #        'item_id': tf.sparse_placeholder(tf.float64),
+            #        'labels': tf.placeholder(tf.int64, shape = (None,)),
+            #        'training':tf.placeholder(tf.bool) 
+            #        }
+            #for star in range(5):
+            #    placeholders['item_neigh_conv{}'.format(star)] = tf.sparse_placeholder(tf.float64)
+            #    placeholders['user_neigh_conv{}'.format(star)] = tf.sparse_placeholder(tf.float64)
+
+            #v_feature_placeholder_dict = {}
+            #for k, v in item_type_dict.items():
+            #    if "categories" != k:
+            #        v_feature_placeholder_dict[k] = tf.placeholder(v, shape = (None,))
+            #v_feature_placeholder_dict["categories"] = tf.sparse_placeholder(tf.string)
+            #
+            #u_feature_placeholder_dict = {}
+            #for k, v in user_type_dict.items():
+            #    u_feature_placeholder_dict[k] = tf.placeholder(v, shape = (None,))
+
+            #placeholders['u_features'] = u_feature_placeholder_dict
+            #placeholders['v_features'] = v_feature_placeholder_dict
+     
+            #    
+            model = cur_MODEL(placeholders, model_params)
+            merged_summary = tf.summary.merge_all()
+    else:
+            model = cur_MODEL(placeholders, model_params)
+            merged_summary = tf.summary.merge_all()
         
-    estimator = tf.estimator.Estimator(
-            lr_model_fn,
-            config=run_config,
-            params=model_params)
 
-    train_spec = tf.estimator.TrainSpec(input_fn=get_input_fn(
-        tf.estimator.ModeKeys.TRAIN, model_params,
-        **input_additional_info), max_steps=args.max_steps)
+    with tf.Session(config=tf.ConfigProto(log_device_placement=False, allow_soft_placement=True)) as sess:
+        sess.run(tf.global_variables_initializer())
+        sess.run(tf.tables_initializer()) 
+        
+        if args.Train:
+            if args.continue_training:
+                model.load(sess) 
+                print('Continue from previous checkout,current step is {}'.format(model.global_step.eval())) 
 
-    eval_spec = tf.estimator.EvalSpec(input_fn=get_input_fn(
-        tf.estimator.ModeKeys.EVAL,
-        model_params,
-        **input_additional_info))
+            train_summary_writer = tf.summary.FileWriter(args.model_dir+'/train') 
+            val_summary_writer = tf.summary.FileWriter(args.model_dir+'/val') 
 
-    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+            for epoch in range(num_epoch):
+                print("This is epoch {}".format(epoch))
+                train_data_generator = data_iterator(new_reviews[train_idx], args.batch_size)
+                train_total_loss = 0
+                train_total_accuracy = 0
+                train_total = 0
+                train_total_mse = 0
 
+                try:
+                    while True:
+                        train_reviews = next(train_data_generator)
+                        train_count = len(train_reviews)
+                        train_feed_dict = construct_feed_dict(placeholders,train_reviews ,additional_info ,model_params)
+                        train_feed_dict[placeholders['training']] = True
+                        train_result =sess.run([model.training_op, model.loss, model.accuracy, model.mse], train_feed_dict)
+                        
+                        
+                        if model.global_step.eval() % args.summary_steps == 0:
+                            print("\nStart Evaluation:") 
+                            val_data_generator = data_iterator(new_reviews[val_idx], args.batch_size)
+                            
+                            val_total_loss = 0
+                            val_total_accuracy = 0
+                            val_total = 0
+                            val_total_mse = 0 
+                            try:
+                                while True:
+                                    val_reviews = next(val_data_generator)
+                                    val_count = len(val_reviews)
+                                    val_feed_dict = construct_feed_dict(placeholders,val_reviews ,additional_info ,model_params)
+                                    val_feed_dict[placeholders['training']] = False 
+                                    val_result = sess.run([model.loss, model.accuracy, model.mse], val_feed_dict)
+                                    val_total_loss += val_result[0] * val_count
+                                    val_total_accuracy += val_result[1] * val_count
+                                    val_total += val_count 
+                                    val_total_mse += val_result[2] * val_count
+                                    progress_bar(val_total, num_val, 'Loss: %.3f | Acc: %.3f%% (%d/%d) | Mse: %.3f' \
+                                            % (val_total_loss/val_total, 100.*val_total_accuracy/val_total, val_total_accuracy, val_total, val_total_mse/val_total))
+
+
+                            except StopIteration:
+                                pass
+                            val_loss = val_total_loss/num_val
+                            val_accuracy = val_total_accuracy/num_val
+                            
+                            summary = sess.run(merged_summary, feed_dict=train_feed_dict)
+                            train_summary_writer.add_summary(summary, model.global_step.eval())
+                            train_summary_writer.flush()
+                            
+                            summary = sess.run(merged_summary, feed_dict=val_feed_dict)
+                            val_summary_writer.add_summary(summary, model.global_step.eval())
+                            val_summary_writer.flush()
+
+                        if model.global_step.eval() % args.save_checkpoint_steps == 0:
+                            '''
+                            Save if we evaluate for 3 times or  model performs good 
+                            '''
+                            model.save(sess)
+
+                        train_total_loss += train_result[1] * train_count
+                        train_total_accuracy += train_result[2] * train_count
+                        train_total_mse += train_result[3] * train_count
+                        train_total += train_count 
+                        progress_bar(train_total, num_train, 'Loss: %.3f | Acc: %.3f%% (%d/%d) | Mse %.3f' \
+                                % (train_total_loss/train_total, 100.*train_total_accuracy/train_total, train_total_accuracy, train_total, train_total_mse/train_total))
+                except StopIteration:
+                    pass
+
+        else:
+            model.load(sess, args.load_version)
+            print('Test from {} checkout point'.format(model.global_step.eval())) 
+            val_data_generator = data_iterator(new_reviews[test_idx], args.batch_size)
+                            
+            val_total_loss = 0
+            val_total_accuracy = 0
+            val_total = 0
+            val_total_mse = 0 
+            try:
+                while True:
+                    val_reviews = next(val_data_generator)
+                    val_count = len(val_reviews)
+                    val_feed_dict = construct_feed_dict(placeholders,val_reviews ,additional_info ,model_params)
+                    val_feed_dict[placeholders['training']] = False 
+                    val_result = sess.run([model.loss, model.accuracy, model.mse], val_feed_dict)
+                    val_total_loss += val_result[0] * val_count
+                    val_total_accuracy += val_result[1] * val_count
+                    val_total += val_count 
+                    val_total_mse += val_result[2] * val_count
+                    progress_bar(val_total, num_val, 'Loss: %.3f | Acc: %.3f%% (%d/%d) | Mse: %.3f' \
+                            % (val_total_loss/val_total, 100.*val_total_accuracy/val_total, val_total_accuracy, val_total, val_total_mse/val_total))
+            except StopIteration:
+                pass
     
     
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch_size', default=1024, help= "assign batchsize for training and eval")
-    parser.add_argument('--learning_rate', default=0.001, help= "learning rate for training")
-    parser.add_argument('--dropout', default=0.2, help= "dropout rate")
-    parser.add_argument('--max_steps', default = 10, help="Max steps to train in trainSpec")
+    parser.add_argument('--summary_steps', default = 200, type=int, help="number of train steps before evaluation once")
     parser.add_argument('--model_dir', default = "tmp/", help="Directory to save model files")
+    parser.add_argument('--use_gpu', default=False, type=bool, help="num of hidden units")
+    parser.add_argument('--dropout', default=0.7, type=float, help= "dropout rate")
+    parser.add_argument('--save_checkpoint_steps', default = 200, type=int, help="number of train steps before evaluation once")
+    parser.add_argument('--Train', action = 'store_false', help="training or not")
+    parser.add_argument('--load_version', default = 1234,type=int,  help="Model version for Testing")
+
+    parser.add_argument('--is_stacked', default = False, type=bool, help="using stack or sum for h layer")
+    parser.add_argument('--num_basis', default = 3, type=int, help="using stack or sum for h layer")
+    parser.add_argument('--bilinear', default = False, type= bool, help="using stack or sum for h layer")
+
+
+    parser.add_argument('--regularizer_parameter', default = 0.0001, type=float, help="Directory to save model files")
+    parser.add_argument('--batch_size', default=10000, type=int, help= "assign batchsize for training and eval")
+    parser.add_argument('--learning_rate', default=0.007,type=float, help= "learning rate for training")
+    parser.add_argument('--dim_user_raw', default=64, type=int, help="num of hidden units")
+    parser.add_argument('--dim_item_raw', default=128, type=int, help="num of hidden units")
+    parser.add_argument('--dim_user_conv', default=64, type=int, help="num of hidden units")
+    parser.add_argument('--dim_item_conv', default=128, type=int, help="num of hidden units")
+    parser.add_argument('--dim_user_embedding', default=128, type=int, help="num of hidden units")
+    parser.add_argument('--dim_item_embedding', default=128, type=int, help="num of hidden units")
+    parser.add_argument('--continue_training', default = False, type = bool, help='continue from last time training or not')
+
     args = parser.parse_args()
     #args = parser.parse_args(['--max_steps=50'])
     main(args)
- 
